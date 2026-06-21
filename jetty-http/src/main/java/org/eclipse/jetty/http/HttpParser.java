@@ -177,6 +177,8 @@ public class HttpParser
     private long _contentPosition;
     private int _chunkLength;
     private int _chunkPosition;
+    private boolean _chunkExtQuoted;   // inside a quoted-string in chunk-ext (CVE-2026-2332)
+    private boolean _chunkExtEscape;   // inside a quoted-pair in chunk-ext
     private boolean _headResponse;
     private boolean _cr;
     private ByteBuffer _contentChunk;
@@ -1778,6 +1780,8 @@ public class HttpParser
                             break;
 
                         case SPACE:
+                            _chunkExtQuoted = false;
+                            _chunkExtEscape = false;
                             setState(State.CHUNK_PARAMS);
                             break;
 
@@ -1790,6 +1794,8 @@ public class HttpParser
                             }
                             else
                             {
+                                _chunkExtQuoted = false;
+                                _chunkExtEscape = false;
                                 setState(State.CHUNK_PARAMS);
                             }
                     }
@@ -1798,13 +1804,19 @@ public class HttpParser
 
                 case CHUNK_PARAMS:
                 {
+                    // RFC 9112 §7.1.1: chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+                    // chunk-ext-val = token / quoted-string
+                    // Reject bare CR/LF inside quoted-strings to prevent request smuggling (CVE-2026-2332).
                     HttpTokens.Token t = next(buffer);
                     if (t == null)
                         break;
 
+                    byte b = t.getByte();
                     switch (t.getType())
                     {
                         case LF:
+                            if (_chunkExtQuoted)
+                                throw new BadMessageException(HttpStatus.BAD_REQUEST_400, "Bad chunk extension");
                             if (_chunkLength == 0)
                             {
                                 setState(State.TRAILER);
@@ -1814,8 +1826,30 @@ public class HttpParser
                             else
                                 setState(State.CHUNK);
                             break;
+                        case CR:
+                            if (_chunkExtQuoted)
+                                throw new BadMessageException(HttpStatus.BAD_REQUEST_400, "Bad chunk extension");
+                            break;
                         default:
-                            break; // TODO review
+                            if (_chunkExtEscape)
+                            {
+                                // quoted-pair: second byte of \X — any octet is valid
+                                _chunkExtEscape = false;
+                            }
+                            else if (_chunkExtQuoted)
+                            {
+                                if (b == '"')
+                                    _chunkExtQuoted = false;
+                                else if (b == '\\')
+                                    _chunkExtEscape = true;
+                                // other printable/non-LF chars are qdtext — allowed
+                            }
+                            else
+                            {
+                                if (b == '"')
+                                    _chunkExtQuoted = true;
+                            }
+                            break;
                     }
                     break;
                 }
@@ -1904,6 +1938,8 @@ public class HttpParser
         _headerBytes = 0;
         _host = false;
         _headerComplete = false;
+        _chunkExtQuoted = false;
+        _chunkExtEscape = false;
     }
 
     protected void setState(State state)
